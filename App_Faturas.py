@@ -1,28 +1,30 @@
 from pathlib import Path
+from urllib.parse import quote
 import io, os, unicodedata
+import requests
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import requests
 from openpyxl.styles import Font, PatternFill, Alignment
 
 st.set_page_config(page_title='Indicador de Faturas',page_icon='📊',layout='wide')
-BASE=Path(__file__).resolve().parent / 'Base Fatura.xlsx'
+BASE = Path(__file__).resolve().parent / 'Base Fatura.xlsx'
 PALETA=['#E30613','#2188FF','#172B85','#FF9D76','#6A5ACD','#22A699']
 
-# Compatibilidade com GitHub/Streamlit Cloud.
+# Compatibilidade com GitHub e Streamlit Community Cloud.
 # Prioridade: arquivo no repositório, Secret do Streamlit e variável de ambiente.
 try:
-    BASE_URL=str(st.secrets.get('BASE_FATURA_URL','')).strip()
+    BASE_URL = str(st.secrets.get('BASE_FATURA_URL', '')).strip()
 except Exception:
-    BASE_URL=''
-BASE_URL=BASE_URL or os.getenv('BASE_FATURA_URL','').strip()
+    BASE_URL = ''
+BASE_URL = BASE_URL or os.getenv('BASE_FATURA_URL', '').strip()
+
 
 def normalizar_url_github(url):
-    url=str(url).strip()
+    url = str(url).strip()
     if 'github.com' in url and '/blob/' in url:
-        url=url.replace('https://github.com/','https://raw.githubusercontent.com/').replace('/blob/','/')
+        url = url.replace('https://github.com/', 'https://raw.githubusercontent.com/').replace('/blob/', '/')
     return url
 
 def sem_acento(v): return ''.join(c for c in unicodedata.normalize('NFKD',str(v)) if not unicodedata.combining(c))
@@ -32,12 +34,12 @@ def unidade(v): return 'Rio de Janeiro' if sem_acento(v).strip().upper()=='RIO D
 @st.cache_data(ttl=3600,show_spinner='Carregando a base...')
 def carregar(mtime=0):
     if BASE.exists():
-        fonte=BASE
+        fonte = BASE
     elif BASE_URL:
-        url=normalizar_url_github(BASE_URL)
-        resposta=requests.get(url,timeout=120)
+        url = normalizar_url_github(BASE_URL)
+        resposta = requests.get(url, timeout=120)
         resposta.raise_for_status()
-        fonte=io.BytesIO(resposta.content)
+        fonte = io.BytesIO(resposta.content)
     else:
         raise FileNotFoundError(
             'Base Fatura.xlsx não encontrada. Inclua o arquivo no mesmo diretório do app '
@@ -327,3 +329,265 @@ with abas[1]:
 
     arquivo_excel=excel_completo(tin,tout,tcv)
     st.download_button('📥 Baixar tabelas em Excel',arquivo_excel,'Custos_Volumes_e_Unitarios.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
+
+
+# ================================================================
+# CENTRAL DE ENVIOS DE TESTE PELO OUTLOOK WEB
+# Mantem o envio individual, prepara todos por unidade e gera o
+# consolidado gerencial. O clique final em Enviar ocorre no Outlook Web.
+# ================================================================
+st.divider()
+
+# Controle de acesso local para toda a Central de envios de teste.
+if 'central_envios_autenticada' not in st.session_state:
+    st.session_state['central_envios_autenticada'] = False
+
+if not st.session_state['central_envios_autenticada']:
+    st.subheader('🔐 Acesso à Central de envios de teste')
+    st.caption('Informe a senha para visualizar e utilizar todas as opções de envio.')
+
+    with st.form('form_acesso_central_envios', clear_on_submit=True):
+        senha_informada = st.text_input(
+            'Senha de acesso',
+            type='password',
+            placeholder='Digite a senha',
+        )
+        acessar_central = st.form_submit_button(
+            '🔓 Acessar Central de envios',
+            use_container_width=True,
+            type='primary',
+        )
+
+    if acessar_central:
+        try:
+            senha_central = str(st.secrets.get('SENHA_CENTRAL_ENVIOS', 'adm'))
+        except Exception:
+            senha_central = os.getenv('SENHA_CENTRAL_ENVIOS', 'adm')
+        if senha_informada == senha_central:
+            st.session_state['central_envios_autenticada'] = True
+            st.rerun()
+        else:
+            st.error('Senha incorreta. Verifique e tente novamente.')
+
+    st.stop()
+
+cabecalho_central, coluna_sair = st.columns([6, 1])
+with cabecalho_central:
+    st.subheader('🧪 Central de envios de teste')
+with coluna_sair:
+    if st.button('🔒 Sair', use_container_width=True, key='sair_central_envios'):
+        st.session_state['central_envios_autenticada'] = False
+        st.session_state.pop('mostrar_emails_lote', None)
+        st.rerun()
+
+st.info(
+    'Modo de teste ativo. Os endereços cadastrados são provisórios. '
+    'Revise os destinatários e os valores antes de enviar.'
+)
+
+DESTINATARIOS_TESTE = {
+    'Brasília': 'andre.dikman@claro.com.br',
+    'Contagem': 'adgsilva@hotmail.com',
+    'Jaboatão': 'daiana.costa@claro.com.br',
+    'Rio de Janeiro': 'emerson.ogihara@claro.com.br',
+    'Campinas': 'ivete.cduraes@claro.com.br',
+    'Contagem': 'paulo.rocha@claro.com.br',
+}
+EMAIL_GERENTE_TESTE = 'andre.dikman@claro.com.br'
+
+
+def resumo_unidade_email(base_unidade):
+    custo = float(base_unidade['Custo'].sum())
+    volume = float(base_unidade['Volume'].sum())
+    custo_cd = float(base_unidade.loc[base_unidade['Tipo_Local'].eq('CD'), 'Custo'].sum())
+    custo_ea = float(base_unidade.loc[base_unidade['Tipo_Local'].eq('EA'), 'Custo'].sum())
+    fluxo = (
+        base_unidade[base_unidade['Tipo_Despesa'].isin(['VOL IN', 'VOL OUT'])]
+        .groupby('Tipo_Despesa', as_index=False)
+        .agg(Custo=('Custo', 'sum'), Volume=('Volume', 'sum'))
+    )
+    fluxo['Unitario'] = np.where(fluxo['Volume'].ne(0), fluxo['Custo']/fluxo['Volume'], np.nan)
+    entrada = fluxo.loc[fluxo['Tipo_Despesa'].eq('VOL IN'), 'Unitario']
+    saida = fluxo.loc[fluxo['Tipo_Despesa'].eq('VOL OUT'), 'Unitario']
+    ui_email = float(entrada.iloc[0]) if not entrada.empty else np.nan
+    uo_email = float(saida.iloc[0]) if not saida.empty else np.nan
+    despesas = (
+        base_unidade.groupby('Tipo_Despesa', as_index=False)['Custo'].sum()
+        .sort_values('Custo', ascending=False).head(8)
+    )
+    linhas = '\n'.join(
+        f"• {r['Tipo_Despesa']}: {brl(float(r['Custo']))}"
+        for _, r in despesas.iterrows()
+    )
+    return {
+        'custo': custo, 'volume': volume, 'custo_cd': custo_cd, 'custo_ea': custo_ea,
+        'ui': ui_email, 'uo': uo_email, 'despesas': linhas,
+    }
+
+
+def corpo_unidade_email(nome_unidade, referencia, resumo):
+    return f'''Olá,
+
+Segue o status de teste do Indicador de Faturas da unidade {nome_unidade}.
+
+Referência: {referencia}
+Unidade: {nome_unidade}
+
+RESUMO EXECUTIVO
+• Custo total: {brl(resumo['custo'])}
+• Custo CD: {brl(resumo['custo_cd'])}
+• Custo EA: {brl(resumo['custo_ea'])}
+• Volume total: {br_num(resumo['volume'], 0)}
+• Custo unitário IN: {'—' if pd.isna(resumo['ui']) else brl(resumo['ui'])}
+• Custo unitário OUT: {'—' if pd.isna(resumo['uo']) else brl(resumo['uo'])}
+
+PRINCIPAIS DESPESAS
+{resumo['despesas'] or 'Sem despesas para o recorte selecionado.'}
+
+Mensagem gerada em modo de teste pelo Indicador de Faturas.
+
+Atenciosamente,
+André Dikman'''
+
+
+def url_outlook_email(destinatario, assunto, corpo):
+    return (
+        'https://outlook.office.com/mail/deeplink/compose'
+        f'?to={quote(destinatario)}&subject={quote(assunto)}&body={quote(corpo)}'
+    )
+
+referencia_envio = pd.Timestamp(max(per)).strftime('%m/%Y') if per else pd.Timestamp(f['Data'].max()).strftime('%m/%Y')
+unidades_base = set(f['Unidade'].dropna().astype(str))
+unidades_envio = sorted(u for u in DESTINATARIOS_TESTE if u in unidades_base)
+
+st.markdown('''
+<style>
+.email-grid{display:grid;grid-template-columns:minmax(160px,.8fr) minmax(330px,1.7fr) minmax(150px,.7fr);gap:14px;margin:10px 0 18px}
+.email-card{min-width:0;padding:14px 16px;background:#fff;border:1px solid #e2e8f0;border-radius:12px;box-shadow:0 2px 8px rgba(23,43,133,.06)}
+.email-label{color:#5b6573;font-size:.86rem;font-weight:600;margin-bottom:6px}
+.email-value{color:#172033;font-size:1.16rem;font-weight:750;line-height:1.25;overflow-wrap:anywhere}
+.email-address{color:#0d63a5;font-size:1.02rem}
+@media(max-width:900px){.email-grid{grid-template-columns:1fr}}
+</style>
+''', unsafe_allow_html=True)
+
+aba_individual, aba_todos, aba_gerente = st.tabs([
+    '📨 Envio individual', '📧 Todos por unidade', '👔 Consolidado gerencial'
+])
+
+with aba_individual:
+    if not unidades_envio:
+        st.warning('Nenhuma unidade de teste possui dados no recorte atual.')
+    else:
+        unidade_escolhida = st.selectbox('Unidade para o teste', unidades_envio, key='unidade_individual')
+        destinatario = DESTINATARIOS_TESTE[unidade_escolhida]
+        resumo = resumo_unidade_email(f[f['Unidade'].eq(unidade_escolhida)].copy())
+        assunto = f'[TESTE] Status de Faturas | {unidade_escolhida} | {referencia_envio}'
+        corpo = corpo_unidade_email(unidade_escolhida, referencia_envio, resumo)
+        st.markdown(f'''<div class="email-grid">
+          <div class="email-card"><div class="email-label">Unidade</div><div class="email-value">{unidade_escolhida}</div></div>
+          <div class="email-card"><div class="email-label">Destinatário de teste</div><div class="email-value email-address">{destinatario}</div></div>
+          <div class="email-card"><div class="email-label">Referência</div><div class="email-value">{referencia_envio}</div></div>
+        </div>''', unsafe_allow_html=True)
+        with st.expander('Visualizar prévia do e-mail', expanded=True):
+            st.markdown(f'**Para:** {destinatario}')
+            st.markdown(f'**Assunto:** {assunto}')
+            st.text_area('Corpo da mensagem', corpo, height=390, disabled=True, key='previa_individual')
+        confirmar_individual = st.checkbox('Confirmo que revisei o envio individual.', key='conf_individual')
+        if confirmar_individual:
+            st.link_button('🧪 Abrir teste no Outlook Web', url_outlook_email(destinatario, assunto, corpo), use_container_width=True, type='primary')
+        else:
+            st.warning('Marque a confirmação para liberar a abertura no Outlook Web.')
+
+with aba_todos:
+    st.caption('Prepara uma mensagem personalizada para cada unidade cadastrada. Cada responsável verá somente a própria unidade.')
+    if not unidades_envio:
+        st.warning('Nenhuma unidade cadastrada possui dados no recorte atual.')
+    else:
+        grade = pd.DataFrame([{'Unidade': u, 'Destinatário de teste': DESTINATARIOS_TESTE[u], 'Status': 'Pronto'} for u in unidades_envio])
+        st.dataframe(grade, use_container_width=True, hide_index=True)
+        st.metric('E-mails preparados', len(unidades_envio))
+        confirmar_todos = st.checkbox(f'Confirmo a preparação de {len(unidades_envio)} e-mails de teste.', key='conf_todos')
+        if st.button('📧 Preparar todos os e-mails por unidade', use_container_width=True, type='primary', disabled=not confirmar_todos):
+            st.session_state['mostrar_emails_lote'] = True
+        if st.session_state.get('mostrar_emails_lote', False):
+            st.success('E-mails preparados. Abra, revise e envie cada mensagem no Outlook Web.')
+            for unidade_lote in unidades_envio:
+                dest_lote = DESTINATARIOS_TESTE[unidade_lote]
+                resumo_lote = resumo_unidade_email(f[f['Unidade'].eq(unidade_lote)].copy())
+                assunto_lote = f'[TESTE] Status de Faturas | {unidade_lote} | {referencia_envio}'
+                corpo_lote = corpo_unidade_email(unidade_lote, referencia_envio, resumo_lote)
+                st.link_button(
+                    f'✉️ Abrir {unidade_lote} | {dest_lote}',
+                    url_outlook_email(dest_lote, assunto_lote, corpo_lote),
+                    use_container_width=True,
+                )
+            st.warning('O Outlook Web exige o clique final em Enviar para cada mensagem. O disparo automático em um único clique necessita de autorização Microsoft Graph (Mail.Send).')
+
+with aba_gerente:
+    st.caption('O gerente recebe uma única mensagem com o resumo executivo e o detalhamento de todas as unidades do recorte selecionado.')
+
+    def titulo_negrito(texto):
+        normal = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+        negrito = '𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵'
+        return str(texto).translate(str.maketrans(normal, negrito))
+
+    resumo_geral = resumo_unidade_email(f.copy())
+    blocos = []
+    for unidade_gerente in sorted(unidades_base):
+        if unidade_gerente == '-':
+            continue
+        resumo_g = resumo_unidade_email(f[f['Unidade'].eq(unidade_gerente)].copy())
+        titulo_unidade = titulo_negrito(unidade_gerente.upper())
+        blocos.append(f'''{titulo_unidade}
+{'─' * 34}
+• Custo total: {brl(resumo_g['custo'])}
+• Custo CD: {brl(resumo_g['custo_cd'])}
+• Custo EA: {brl(resumo_g['custo_ea'])}
+• Volume total: {br_num(resumo_g['volume'], 0)}
+• Unitário IN: {'—' if pd.isna(resumo_g['ui']) else brl(resumo_g['ui'])}
+• Unitário OUT: {'—' if pd.isna(resumo_g['uo']) else brl(resumo_g['uo'])}''')
+
+    separador_unidades = '\n\n\n'.join(blocos)
+    corpo_gerente = f'''Olá,
+
+Segue o consolidado gerencial de teste do Indicador de Faturas.
+
+{titulo_negrito('REFERÊNCIA')}: {referencia_envio}
+{titulo_negrito('UNIDADES DETALHADAS')}: {len(blocos)}
+
+{titulo_negrito('RESUMO EXECUTIVO')}
+{'═' * 42}
+• Custo total: {brl(resumo_geral['custo'])}
+• Custo CD: {brl(resumo_geral['custo_cd'])}
+• Custo EA: {brl(resumo_geral['custo_ea'])}
+• Volume total: {br_num(resumo_geral['volume'], 0)}
+• Custo unitário IN: {'—' if pd.isna(resumo_geral['ui']) else brl(resumo_geral['ui'])}
+• Custo unitário OUT: {'—' if pd.isna(resumo_geral['uo']) else brl(resumo_geral['uo'])}
+
+
+{titulo_negrito('DETALHAMENTO POR UNIDADE')}
+{'═' * 42}
+
+{separador_unidades}
+
+
+Mensagem gerada em modo de teste pelo Indicador de Faturas.
+
+Atenciosamente,
+André Dikman'''
+    assunto_gerente = f'[TESTE] Consolidado Gerencial de Faturas | {referencia_envio}'
+    st.markdown(f'''<div class="email-grid">
+      <div class="email-card"><div class="email-label">Tipo</div><div class="email-value">Consolidado</div></div>
+      <div class="email-card"><div class="email-label">Gerente de teste</div><div class="email-value email-address">{EMAIL_GERENTE_TESTE}</div></div>
+      <div class="email-card"><div class="email-label">Unidades</div><div class="email-value">{len(blocos)}</div></div>
+    </div>''', unsafe_allow_html=True)
+    with st.expander('Visualizar consolidado gerencial', expanded=True):
+        st.markdown(f'**Para:** {EMAIL_GERENTE_TESTE}')
+        st.markdown(f'**Assunto:** {assunto_gerente}')
+        st.text_area('Corpo consolidado', corpo_gerente, height=650, disabled=True, key='previa_gerente')
+    confirmar_gerente = st.checkbox('Confirmo que revisei o consolidado gerencial.', key='conf_gerente')
+    if confirmar_gerente:
+        st.link_button('👔 Abrir consolidado no Outlook Web', url_outlook_email(EMAIL_GERENTE_TESTE, assunto_gerente, corpo_gerente), use_container_width=True, type='primary')
+    else:
+        st.warning('Marque a confirmação para liberar a abertura no Outlook Web.')
